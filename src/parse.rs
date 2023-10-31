@@ -86,17 +86,29 @@ pub(crate) fn cfg_attr(input: ParseStream) -> Result<AWD> {
         deny: Vec::new(),
     };
 
+    macro_rules! or_return {
+        ($e:expr) => {
+            match $e {
+                Ok(x) => x,
+                Err(_) => {
+                    return Ok(awd);
+                }
+            }
+        };
+    }
+
+    or_return!(input.parse::<Token![,]>());
+
     loop {
-        input.parse::<Token![,]>()?;
         if input.peek(kw::allow) {
-            input.parse::<kw::allow>()?;
-            awd.allow.extend(cfg_attr_inner(input)?);
+            or_return!(input.parse::<kw::allow>());
+            awd.allow.extend(or_return!(cfg_attr_inner(input)));
         } else if input.peek(kw::warn) {
-            input.parse::<kw::warn>()?;
-            awd.warn.extend(cfg_attr_inner(input)?);
+            or_return!(input.parse::<kw::warn>());
+            awd.warn.extend(or_return!(cfg_attr_inner(input)));
         } else if input.peek(kw::deny) {
-            input.parse::<kw::deny>()?;
-            awd.deny.extend(cfg_attr_inner(input)?);
+            or_return!(input.parse::<kw::deny>());
+            awd.deny.extend(or_return!(cfg_attr_inner(input)));
         } else {
             return Ok(awd);
         }
