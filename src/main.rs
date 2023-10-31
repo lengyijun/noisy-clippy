@@ -34,7 +34,7 @@ use std::cmp::Reverse;
 use std::collections::btree_map::{BTreeMap as Map, Entry};
 use std::ffi::OsStr;
 use std::fs::File;
-use std::io::{self, BufReader, Read, Write};
+use std::io::{BufReader, Read, Write};
 use std::iter::{self, FromIterator};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -50,7 +50,14 @@ struct AttrVisitor<'a> {
     lints: &'a Map<&'a str, &'a Lint>,
 }
 
-type Findings = Map<String, Map<SourceFile, Locations>>;
+#[derive(Default)]
+struct ADW {
+    allow: Map<String, Map<SourceFile, Locations>>,
+    warn: Map<String, Map<SourceFile, Locations>>,
+    deny: Map<String, Map<SourceFile, Locations>>,
+}
+
+type Findings = ADW;
 
 #[derive(Clone, Ord, PartialOrd, Eq, PartialEq)]
 struct SourceFile {
@@ -78,6 +85,10 @@ impl<'ast, 'a> Visit<'ast> for AttrVisitor<'a> {
         let attr_path = attr.path();
         let parser = if attr_path.is_ident("allow") {
             parse::allow
+        } else if attr_path.is_ident("warn") {
+            parse::warn
+        } else if attr_path.is_ident("deny") {
+            parse::deny
         } else if attr_path.is_ident("cfg_attr") {
             parse::cfg_attr
         } else {
@@ -90,25 +101,35 @@ impl<'ast, 'a> Visit<'ast> for AttrVisitor<'a> {
             return;
         }
         let mut findings = self.findings.lock();
-        for (mut lint_id, span) in lints {
-            lint_id = match self.lints.get(lint_id.as_str()) {
-                Some(renamed_lint) => renamed_lint.id.clone(),
-                None => lint_id,
+
+        macro_rules! update_lint_locations {
+            ($path:ident) => {
+                for (mut lint_id, span) in lints.$path {
+                    lint_id = match self.lints.get(lint_id.as_str()) {
+                        Some(renamed_lint) => renamed_lint.id.clone(),
+                        None => lint_id,
+                    };
+                    let locations = findings
+                        .$path
+                        .entry(lint_id)
+                        .or_insert_with(Map::new)
+                        .entry(self.source_file.clone())
+                        .or_insert_with(|| Locations {
+                            contents: Arc::clone(&self.contents),
+                            global: Vec::new(),
+                            local: Vec::new(),
+                        });
+                    match attr.style {
+                        AttrStyle::Outer => locations.local.push(span),
+                        AttrStyle::Inner(_) => locations.global.push(span),
+                    }
+                }
             };
-            let locations = findings
-                .entry(lint_id)
-                .or_insert_with(Map::new)
-                .entry(self.source_file.clone())
-                .or_insert_with(|| Locations {
-                    contents: Arc::clone(&self.contents),
-                    global: Vec::new(),
-                    local: Vec::new(),
-                });
-            match attr.style {
-                AttrStyle::Outer => locations.local.push(span),
-                AttrStyle::Inner(_) => locations.global.push(span),
-            }
         }
+
+        update_lint_locations!(allow);
+        update_lint_locations!(warn);
+        update_lint_locations!(deny);
     }
 }
 
@@ -158,7 +179,7 @@ fn main() -> Result<()> {
         .unwrap();
 
     // Parse .crate files in parallel on rayon thread pool.
-    let findings = Mutex::new(Map::new());
+    let findings = Mutex::new(Default::default());
     crate_max_versions
         .into_par_iter()
         .for_each(|(krate, version)| {
@@ -168,82 +189,90 @@ fn main() -> Result<()> {
             }
         });
 
-    // Limit rendered occurrences per file and per crate.
     const MAX_PER_FILE: usize = 5;
     const MAX_PER_CRATE: usize = 10;
     let mut findings = findings.into_inner();
-    for findings in findings.values_mut() {
-        let mut count_by_crate = Map::new();
-        for (source_file, locations) in findings {
-            locations.global.truncate(MAX_PER_FILE);
-            locations
-                .local
-                .truncate(MAX_PER_FILE - locations.global.len());
-            let n = count_by_crate.entry(&source_file.krate).or_insert(0);
-            let remaining_for_crate = MAX_PER_CRATE - *n;
-            locations.global.truncate(remaining_for_crate);
-            locations
-                .local
-                .truncate(remaining_for_crate - locations.global.len());
-            *n += locations.global.len() + locations.local.len();
-        }
+
+    macro_rules! limit_occurrence {
+        ($field:ident) => {
+            // Limit rendered occurrences per file and per crate.
+            for findings in findings.$field.values_mut() {
+                let mut count_by_crate = Map::new();
+                for (source_file, locations) in findings {
+                    locations.global.truncate(MAX_PER_FILE);
+                    locations
+                        .local
+                        .truncate(MAX_PER_FILE - locations.global.len());
+                    let n = count_by_crate.entry(&source_file.krate).or_insert(0);
+                    let remaining_for_crate = MAX_PER_CRATE - *n;
+                    locations.global.truncate(remaining_for_crate);
+                    locations
+                        .local
+                        .truncate(remaining_for_crate - locations.global.len());
+                    *n += locations.global.len() + locations.local.len();
+                }
+            }
+
+            // Sort lints by how many times ignored.
+            let mut findings = Vec::from_iter(&findings.$field);
+            findings.sort_by_cached_key(|(_lint_id, findings)| {
+                let sum: usize = findings
+                    .values()
+                    .map(|loc| loc.global.len() + loc.local.len())
+                    .sum();
+                Reverse(sum)
+            });
+
+            // Print markdown table of results.
+            let mut stdout = File::create(format!("{}.md", stringify!($field)))?;
+            let _ = writeln!(stdout, "local | global | lint name | category");
+            let _ = writeln!(stdout, "--- | --- | --- | ---");
+            let site = "https://dtolnay.github.io/noisy-clippy";
+            for (lint_id, findings) in &findings {
+                let (group, level) = match lints.get(lint_id.as_str()) {
+                    Some(lint) => (lint.group, lint.level),
+                    None => (LintGroup::Unknown, LintLevel::None),
+                };
+                let allowed = level == LintLevel::Allow;
+                let _ = write!(stdout, "{}", if allowed { "~*" } else { "" });
+                let local: usize = findings.values().map(|loc| loc.local.len()).sum();
+                let _ = if local == 0 {
+                    write!(stdout, "{}", local)
+                } else {
+                    write!(stdout, "[{}]({}/{}.html#local)", local, site, lint_id)
+                };
+                let _ = write!(stdout, "{}", if allowed { "*~" } else { "" });
+                let _ = write!(stdout, " | ");
+                let _ = write!(stdout, "{}", if allowed { "~*" } else { "" });
+                let global: usize = findings.values().map(|loc| loc.global.len()).sum();
+                let _ = if global == 0 {
+                    write!(stdout, "{}", global)
+                } else {
+                    write!(stdout, "[{}]({}/{}.html#global)", global, site, lint_id)
+                };
+                let _ = write!(stdout, "{}", if allowed { "*~" } else { "" });
+                let _ = write!(stdout, " | ");
+                let _ = write!(stdout, "{}", if allowed { "~*" } else { "**" });
+                let clippy_index_html = "https://rust-lang.github.io/rust-clippy/master/index.html";
+                let _ = write!(stdout, "[{1}]({0}#{1})", clippy_index_html, lint_id);
+                let _ = write!(stdout, "{}", if allowed { "*~" } else { "**" });
+                let _ = write!(stdout, " | ");
+                let mut former_group = lints::former_lint_group(lint_id);
+                if former_group == Some(group) {
+                    former_group = None;
+                }
+                if let Some(former_group) = former_group {
+                    let _ = write!(stdout, "~*{}*~ ", former_group);
+                }
+                let _ = write!(stdout, "{}", group);
+                let _ = writeln!(stdout);
+            }
+        };
     }
 
-    // Sort lints by how many times ignored.
-    let mut findings = Vec::from_iter(&findings);
-    findings.sort_by_cached_key(|(_lint_id, findings)| {
-        let sum: usize = findings
-            .values()
-            .map(|loc| loc.global.len() + loc.local.len())
-            .sum();
-        Reverse(sum)
-    });
-
-    // Print markdown table of results.
-    let stdout = io::stdout();
-    let mut stdout = stdout.lock();
-    let _ = writeln!(stdout, "local | global | lint name | category");
-    let _ = writeln!(stdout, "--- | --- | --- | ---");
-    let site = "https://dtolnay.github.io/noisy-clippy";
-    for (lint_id, findings) in &findings {
-        let (group, level) = match lints.get(lint_id.as_str()) {
-            Some(lint) => (lint.group, lint.level),
-            None => (LintGroup::Unknown, LintLevel::None),
-        };
-        let allowed = level == LintLevel::Allow;
-        let _ = write!(stdout, "{}", if allowed { "~*" } else { "" });
-        let local: usize = findings.values().map(|loc| loc.local.len()).sum();
-        let _ = if local == 0 {
-            write!(stdout, "{}", local)
-        } else {
-            write!(stdout, "[{}]({}/{}.html#local)", local, site, lint_id)
-        };
-        let _ = write!(stdout, "{}", if allowed { "*~" } else { "" });
-        let _ = write!(stdout, " | ");
-        let _ = write!(stdout, "{}", if allowed { "~*" } else { "" });
-        let global: usize = findings.values().map(|loc| loc.global.len()).sum();
-        let _ = if global == 0 {
-            write!(stdout, "{}", global)
-        } else {
-            write!(stdout, "[{}]({}/{}.html#global)", global, site, lint_id)
-        };
-        let _ = write!(stdout, "{}", if allowed { "*~" } else { "" });
-        let _ = write!(stdout, " | ");
-        let _ = write!(stdout, "{}", if allowed { "~*" } else { "**" });
-        let clippy_index_html = "https://rust-lang.github.io/rust-clippy/master/index.html";
-        let _ = write!(stdout, "[{1}]({0}#{1})", clippy_index_html, lint_id);
-        let _ = write!(stdout, "{}", if allowed { "*~" } else { "**" });
-        let _ = write!(stdout, " | ");
-        let mut former_group = lints::former_lint_group(lint_id);
-        if former_group == Some(group) {
-            former_group = None;
-        }
-        if let Some(former_group) = former_group {
-            let _ = write!(stdout, "~*{}*~ ", former_group);
-        }
-        let _ = write!(stdout, "{}", group);
-        let _ = writeln!(stdout);
-    }
+    limit_occurrence!(allow);
+    limit_occurrence!(warn);
+    limit_occurrence!(deny);
 
     for () in iter::once(()) {
         let Ok(repo) = Repository::discover(".") else {
@@ -259,7 +288,7 @@ fn main() -> Result<()> {
         let tree_entries = None;
         let mut builder = repo.treebuilder(tree_entries)?;
         let filemode = u32::from(FileMode::Blob) as i32;
-        for (lint_id, findings) in &findings {
+        for (lint_id, findings) in &findings.allow {
             let html = render(lint_id, findings);
             let filename = format!("{}.html", lint_id);
             let oid = repo.blob(html.as_bytes())?;

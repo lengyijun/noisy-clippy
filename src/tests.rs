@@ -17,10 +17,13 @@ fn test_attr_visitor() {
         fn main() {
             #[cfg_attr(feature = "cargo-clippy", allow(jkl))]
             let _;
+
+            #[cfg_attr(feature = "cargo-clippy", allow(alice), warn(bob))]
+            let _;
         }
     };
 
-    let findings = Mutex::new(Map::new());
+    let findings = Mutex::new(Default::default());
     let mut visitor = AttrVisitor {
         source_file: &SourceFile {
             krate: Crate::new("test".to_owned()),
@@ -36,6 +39,8 @@ fn test_attr_visitor() {
     visitor.visit_file(&file);
 
     let findings = findings.into_inner();
-    assert_eq!(findings["asdf"].len(), 1);
-    assert_eq!(findings["jkl"].len(), 1);
+    assert_eq!(findings.allow["asdf"].len(), 1);
+    assert_eq!(findings.allow["jkl"].len(), 1);
+    assert_eq!(findings.allow["alice"].len(), 1);
+    assert_eq!(findings.warn["bob"].len(), 1);
 }
